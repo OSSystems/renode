@@ -1,0 +1,207 @@
+name: "Sync main-ossystems-next"
+
+# Daily:
+#   1. Mirror upstream (renode/renode) master -> origin master.
+#   2. Rebase the OSSystems patches (commits on main-ossystems past the
+#      upstream fork point) onto the freshly-synced master.
+#   3. Retarget the src/Infrastructure submodule to the tip of
+#      OSSystems/renode-infrastructure @ main-ossystems-next.
+#   4. Validate: ./build.sh + ./renode-test --type nunit (on .NET 10).
+#   5. On success -> force-push the rebuilt main-ossystems-next and drop any
+#      stale broken branch. On any failure (cherry-pick conflict, missing
+#      infra branch, build or test failure) -> park the candidate on a single
+#      sync-broken branch (replaced each consecutive failure) and leave
+#      main-ossystems-next and main-ossystems untouched.
+
+on:
+  schedule:
+    # Daily at 04:30 UTC (01:30 BRT), after renode-infrastructure's sync.
+    - cron: '30 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.repository }}-sync-main-next
+  cancel-in-progress: false
+
+env:
+  INFRA_URL: https://github.com/OSSystems/renode-infrastructure.git
+  INFRA_BRANCH: main-ossystems-next
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout main-ossystems (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main-ossystems
+          submodules: false
+
+      - name: Configure git and fetch refs
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/renode/renode.git
+          git fetch --no-tags upstream master
+          git fetch --no-tags origin master main-ossystems main-ossystems-next \
+            || git fetch --no-tags origin master main-ossystems
+
+      - name: Sync master from upstream (fast-forward mirror)
+        run: |
+          set -euo pipefail
+          # master mirrors upstream/master: fast-forward only (no --force).
+          git push origin upstream/master:refs/heads/master
+          echo "master synced to $(git rev-parse --short upstream/master)"
+
+      - name: Build candidate (rebase patches + retarget Infrastructure)
+        id: plan
+        run: |
+          set -euo pipefail
+
+          # Resolve the integration inputs up front.
+          INFRA_SHA=$(git ls-remote "$INFRA_URL" "refs/heads/$INFRA_BRANCH" | cut -f1)
+          if [ -z "$INFRA_SHA" ]; then
+            echo "::error::$INFRA_URL has no $INFRA_BRANCH branch yet — run the renode-infrastructure sync first"
+            echo "outcome=error" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          echo "infra_sha=$INFRA_SHA" >> "$GITHUB_OUTPUT"
+
+          FORK=$(git merge-base origin/main-ossystems upstream/master)
+          echo "Fork point: $FORK"
+          git checkout -B sync-candidate upstream/master
+
+          # Replay the OSSystems patches onto the new upstream master. Skip any
+          # commit that only bumps the src/Infrastructure gitlink: that pointer
+          # is set explicitly by the retarget step below to the $INFRA_BRANCH
+          # tip, and replaying a stale pin conflicts once upstream moves its own
+          # Infrastructure pointer (the cause of the earlier cherry-pick CONFLICT).
+          FAILED_SHA=""
+          for sha in $(git rev-list --reverse "$FORK..origin/main-ossystems"); do
+            if [ "$(git diff-tree --no-commit-id --name-only -r "$sha")" = "src/Infrastructure" ]; then
+              echo "Skipping submodule-pin commit $sha (Infrastructure is retargeted to $INFRA_BRANCH)"
+              continue
+            fi
+            if git cherry-pick -x "$sha"; then
+              continue
+            fi
+            if git diff --quiet && git diff --cached --quiet; then
+              git cherry-pick --skip   # already upstream
+              continue
+            fi
+            FAILED_SHA="$sha"
+            git cherry-pick --abort
+            break
+          done
+
+          if [ -n "$FAILED_SHA" ]; then
+            git commit --allow-empty \
+              -m "CONFLICT: cherry-pick stopped at ${FAILED_SHA} $(git log -1 --format=%s "$FAILED_SHA")"
+            echo "outcome=conflict" >> "$GITHUB_OUTPUT"
+            echo "::warning::cherry-pick conflict on ${FAILED_SHA}"
+            exit 0
+          fi
+
+          # Retarget the Infrastructure submodule to the integration branch tip.
+          git config -f .gitmodules submodule.src/Infrastructure.branch "$INFRA_BRANCH"
+          git update-index --cacheinfo "160000,$INFRA_SHA,src/Infrastructure"
+          git add .gitmodules
+          git commit -m "Infrastructure: Bump to $INFRA_BRANCH #${INFRA_SHA:0:8}"
+
+          # No-change gate: build/promote only if the rebuilt candidate differs
+          # from the current integration branch. When nothing moved (upstream
+          # master, Infrastructure tip, or patches) the trees match and the
+          # ~50-min build is skipped entirely.
+          if git diff --quiet sync-candidate origin/main-ossystems-next 2>/dev/null; then
+            echo "outcome=nochange" >> "$GITHUB_OUTPUT"
+            echo "main-ossystems-next already up to date — skipping build"
+          else
+            echo "outcome=clean" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Cache .NET 10 SDK
+        if: steps.plan.outputs.outcome == 'clean'
+        uses: actions/cache@v4
+        with:
+          # Stored server-side and restored onto any hosted runner, so it
+          # survives across runs even though each run gets a fresh VM.
+          path: ~/dotnet
+          key: dotnet-sdk-10.0.300-linux-x64
+
+      - name: Install .NET 10 SDK
+        if: steps.plan.outputs.outcome == 'clean'
+        run: |
+          set -euo pipefail
+          # Download only on a cache miss; the cache hit leaves ~/dotnet in place.
+          if [ ! -x "$HOME/dotnet/dotnet" ]; then
+            url="https://builds.dotnet.microsoft.com/dotnet/Sdk/10.0.300/dotnet-sdk-10.0.300-linux-x64.tar.gz"
+            mkdir -p "$HOME/dotnet"
+            curl -fsSL "$url" -o /tmp/dotnet-sdk.tar.gz
+            tar zxf /tmp/dotnet-sdk.tar.gz -C "$HOME/dotnet"
+          fi
+          # Persist DOTNET_ROOT and PATH to the build/test steps.
+          echo "DOTNET_ROOT=$HOME/dotnet" >> "$GITHUB_ENV"
+          echo "$HOME/dotnet" >> "$GITHUB_PATH"
+          "$HOME/dotnet/dotnet" --version
+
+      - name: Cache NuGet and renode-resources
+        if: steps.plan.outputs.outcome == 'clean'
+        uses: actions/cache@v4
+        with:
+          # tlib (output/bin) is deliberately NOT cached: its sources change
+          # with upstream, and a stale .so would mask real breakage.
+          path: |
+            ~/.nuget/packages
+            lib/resources
+          key: renode-deps-${{ runner.os }}
+          restore-keys: renode-deps-${{ runner.os }}
+
+      - name: Install build/test dependencies
+        if: steps.plan.outputs.outcome == 'clean'
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            git automake cmake autoconf libtool g++ coreutils policykit-1 \
+            libgtk-3-dev uml-utilities gtk-sharp3 python3 python3-pip
+          python3 -m pip install --break-system-packages -r tests/requirements.txt
+
+      - name: Validate (build + NUnit)
+        id: validate
+        if: steps.plan.outputs.outcome == 'clean'
+        run: |
+          set -uo pipefail
+          ok=true
+          git submodule sync --recursive
+          git submodule update --init --recursive || ok=false
+          if [ "$ok" = true ]; then ./build.sh || ok=false; fi
+          if [ "$ok" = true ]; then ./renode-test --type nunit || ok=false; fi
+          echo "ok=$ok" >> "$GITHUB_OUTPUT"
+          echo "Validation result: ok=$ok"
+
+      - name: Promote candidate to main-ossystems-next
+        if: steps.plan.outputs.outcome == 'clean' && steps.validate.outputs.ok == 'true'
+        run: |
+          set -euo pipefail
+          git push origin sync-candidate:refs/heads/main-ossystems-next --force
+          git push origin --delete sync-broken || true
+          echo "main-ossystems-next updated (Infrastructure ${{ steps.plan.outputs.infra_sha }})"
+
+      - name: Quarantine broken candidate
+        if: |
+          always() &&
+          (steps.plan.outputs.outcome == 'conflict' ||
+           (steps.plan.outputs.outcome == 'clean' && steps.validate.outputs.ok != 'true'))
+        run: |
+          set -euo pipefail
+          # Single broken branch, force-replaced on each consecutive failure.
+          # main-ossystems-next and main-ossystems are left untouched.
+          git push origin sync-candidate:refs/heads/sync-broken --force
+          echo "::error::Sync failed — candidate parked on sync-broken; main-ossystems-next untouched"
+          exit 1
